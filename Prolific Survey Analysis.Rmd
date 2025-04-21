@@ -1,0 +1,207 @@
+---
+title: "R Notebook"
+output:
+  pdf_document: default
+  html_document:
+    df_print: paged
+---
+
+# Libraries
+```{r}
+# Load libraries
+library(tidyverse)
+library(googlesheets4)
+library(clipr)
+library(sandwich)
+library(lmtest)
+```
+
+
+## Function for robust standard error
+```{r}
+library(stargazer)
+fn_robust_errors = function(mod){
+  mod$vcovHC_ <- vcovHC(mod)
+  coeftest(mod, vcov. = mod$vcovHC_)
+
+  stargazer(
+  mod, 
+  type = 'text',
+  se=list(sqrt(diag(mod$vcovHC_))), 
+  header=F
+  )
+}
+
+# Print out confidence intervals
+fn_confidence <- function(m, se) {
+  cat(
+    paste0(
+      "Mean: ", m, "\n",
+      "Low: ", m - (1.96 * se), "\n",
+      "High: ", m + (1.96 * se)
+    )
+  )
+}
+```
+
+
+# Prolific Respondent Pool
+
+
+
+## Day 1 ETL
+```{r}
+df_survey_1 = read_sheet('https://docs.google.com/spreadsheets/d/1DnjmX-oINxHNkPx36ObpLDDIZUCb9zVBguSw4CrM1oc/edit?resourcekey=&gid=79303235#gid=79303235') # Day 1 survey
+
+# New column names
+cols_rename = c("timestamp", "prolific_id", "coffee_screener", "wakeup_time", "coffee_time", "hours_woke_up", "q_coffee_amount", "q_awake", "q_difficult_task", "q_tired", "q_alertness_diff", "q_additional_comments")
+
+# Rename columnes
+colnames(df_survey_1) = cols_rename
+ 
+
+# Processing
+df_survey_1 = df_survey_1 %>% 
+  mutate(
+    prolific_id = as.character(prolific_id), # Unnest ID
+    # Parse # from the coffee amount
+    q_coffee_amount = str_extract(q_coffee_amount, "\\d+"),
+    hours_woke_up = as.character(hours_woke_up),
+    # Parse # from metric fields
+    across(c(hours_woke_up, q_difficult_task, hours_woke_up, q_awake, q_difficult_task, q_tired), ~as.numeric(str_extract(.x, "^\\d+")))
+    ) %>% 
+  # Filter out duplicate entries and only take each person's first one from the first day
+  arrange(prolific_id, timestamp) %>% 
+  group_by(prolific_id) %>% mutate(n_surveys = n()) %>% # Total number of surveys taken
+  mutate(surv_num = row_number()) %>% 
+  ungroup() %>% filter(surv_num==1) %>% 
+  # Filter out blank rows
+  filter(!is.na(timestamp)) %>% 
+  # Create alertness score (avg of 3 metrics)
+  mutate(alertness_score = rowMeans(across(c(q_awake, q_difficult_task, q_tired)))) %>% 
+  # Filter out non-compliers (people who didn't drink coffee within 15-45 minutes of waking)
+  mutate(coff_min_wakeup = coffee_time-wakeup_time) %>% 
+  mutate(coffee_min_wakeup = as.numeric(str_extract(coff_min_wakeup, "^\\d+"))) %>% 
+  mutate(coffee_min_wakeup = coffee_min_wakeup/60) %>% 
+  filter(coffee_min_wakeup>=15 & coffee_min_wakeup<=45)
+
+
+
+```
+## Day 2 ETL
+```{r}
+# Survey day 2
+df_survey_2 = read_sheet('https://docs.google.com/spreadsheets/d/1WW7nzk-jSw7TsxIh-9HgEyjXp403PIAKV7ODmW0GFIE/edit?resourcekey=&gid=739215691#gid=739215691') # Day 1 survey
+
+# New column names
+cols_rename = c("timestamp", "prolific_id", "coffee_screener", "wakeup_time", "coffee_time", "hours_woke_up", "q_coffee_amount", "q_awake", "q_difficult_task", "q_tired", "q_alertness_diff", "q_additional_comments")
+# Add "2" suffix to each column to flag as 2nd day responses
+cols_rename = paste0(cols_rename, "_2")
+
+# Rename columnes
+colnames(df_survey_2) = cols_rename
+
+# Processing
+df_survey_2 = df_survey_2 %>% 
+  mutate(
+    prolific_id_2 = as.character(prolific_id_2), # Unnest ID
+    q_coffee_amount_2 = str_extract(q_coffee_amount_2, "\\d+"),
+    hours_woke_up_2 = as.character(hours_woke_up_2),
+    across(c(hours_woke_up_2, q_difficult_task_2, hours_woke_up_2, q_awake_2, q_difficult_task_2, q_tired_2), ~as.numeric(str_extract(.x, "^\\d+")))
+    ) %>% 
+  # Filter out duplicate entries and only take each person's first one
+  arrange(prolific_id_2, timestamp_2) %>% 
+  group_by(prolific_id_2) %>% mutate(n_surveys_2 = n()) %>% # Total number of surveys taken
+  mutate(surv_num_2 = row_number()) %>% 
+  ungroup() %>% filter(surv_num_2==1) %>% 
+  # Filter out blank rows
+  filter(!is.na(timestamp_2)) %>% 
+  # Create composite alertness score
+  mutate(alertness_score_2 = rowMeans(across(c(q_awake_2, q_difficult_task_2, q_tired_2)))) %>% 
+  # Filter out non-compliers (people who didn't drink coff within 2-5 hours of waking up)
+  mutate(coff_min_wakeup = coffee_time_2-wakeup_time_2) %>% 
+  mutate(coffee_min_wakeup = as.numeric(str_extract(coff_min_wakeup, "^\\d+"))) %>% 
+  mutate(coffee_min_wakeup = coffee_min_wakeup/3600) %>% 
+  filter(coffee_min_wakeup>=2 & coffee_min_wakeup<=4)
+
+
+
+```
+
+
+## Merge data sources
+```{r}
+df_survey_merged = df_survey_1 %>% 
+  inner_join(df_survey_2, by = c("prolific_id" = "prolific_id_2")) %>% 
+  # Calculate treatment effect for main metrics
+  mutate(
+    hours_woke_up_delta = hours_woke_up_2 - hours_woke_up,
+    q_awake_delta = q_awake_2 - q_awake,
+    q_difficult_task_delta = q_difficult_task_2 - q_difficult_task,
+    # q_alertness_delta = q_alert
+    q_alertness_score_delta = alertness_score_2 - alertness_score
+  )  %>%
+  filter(coffee_screener=="Yes")
+```
+
+
+## T-Test Results
+```{r}
+
+# Look at simple average
+df_survey_merged %>%
+  select(contains("delta")) %>%
+  # pivot_longer(is.numeric) %>%
+  # ggplot(aes(value)) + geom_histogram() + facet_wrap(~name) + theme_light()
+  summarise(across(is.numeric, ~mean(.x, na.rm=T)), .groups = "drop")
+
+
+
+# Use this!!
+t.test(df_survey_merged$alertness_score_2, df_survey_merged$alertness_score)
+
+```
+
+## Histogram of dependent variable
+```{r}
+df_survey_merged %>% 
+  ggplot(aes(q_alertness_score_delta)) + geom_histogram(fill = "steelblue") + theme_light() + 
+  labs(title = "Distribution of alertness score differences", x = "Alertness Score Difference from Day 1 & 2", y = "Count")
+```
+
+
+
+
+
+## Control for cofee amount
+Only two people subbmited 4+ cups a day
+
+* There's only stat sig with 4+, but only 2 people so don't reco using it
+```{r}
+df_survey_merged
+
+mod_amount = lm(q_difficult_task_delta ~ q_coffee_amount, data = df_survey_merged)
+summary(mod_amount)
+fn_robust_errors(mod_amount)
+
+# Pull count
+df_survey_merged %>% 
+  count(q_coffee_amount)
+```
+
+
+## Control for wake-up time
+No Stat sig
+```{r}
+mod_wakeup = lm(q_difficult_task_delta ~ wakeup_time, data = df_survey_merged)
+summary(mod_wakeup)
+```
+## Control for coffee time
+No stat sig for coffee time
+```{r}
+mod_coffee_time = lm(q_difficult_task_delta ~ coffee_time, data = df_survey_merged)
+summary(mod_coffee_time)
+```
+
+
+
